@@ -1,0 +1,19 @@
+# Virtual Environments
+.venv/
+venv/
+
+# Environment Variables
+*.env
+.env*
+
+# PyCache Files
+/__pycache__/
+*.py[cod]
+
+# Custom Files
+pre_run_checks.py
+
+# Safe Tenseor Files
+/saved_models
+*.safetensors
+config.json
