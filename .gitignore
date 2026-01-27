@@ -14,6 +14,6 @@ venv/
 pre_run_checks.py
 
 # Safe Tenseor Files
-/saved_models
+saved_models/
 *.safetensors
 config.json
