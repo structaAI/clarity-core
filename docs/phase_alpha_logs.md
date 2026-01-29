@@ -30,4 +30,6 @@ This is the specific novelty of our research. We have implemented the parallel h
 
 A final linear/convolutional layer that projects the transformer tokens back into the $64 \times 64 \times 4$ latent shape for the VAE decoder to eventually read.
 
+**Phase $\alpha$.2 completed: 29th Jan 2026**
+
 ---
