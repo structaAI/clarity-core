@@ -31,6 +31,10 @@ class SwinPatchEmbed(nn.Module):
     self.projection: nn.Conv2d = nn.Conv2d(no_of_in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
     self.norm: nn.LayerNorm = nn.LayerNorm(embed_dim)
   
-  def forward(self, x: torch.Tensor)-> torch.Tensor:
-    x = self.projection(x).flatten(2).transpose(1, 2)
-    return self.norm(x)
+  def forward(self, x: torch.Tensor)-> Tuple[torch.Tensor, Tuple[int, int]]:
+    x = self.projection(x)
+    _, _, H, W = x.shape
+
+    x = x.flatten(2).transpose(1, 2)
+
+    return self.norm(x), (H, W)
