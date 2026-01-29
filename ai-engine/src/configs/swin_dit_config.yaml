@@ -2,26 +2,26 @@
 
 model:
   name: "Auth-SwinDiff-V1"
-  latent_size: 64            # Verified 64x64 from Phase-Alpha.0
-  in_channels: 4             # VAE latent channels
-  patch_size: 2              # 2x2 patches for scaling efficiency
-  embed_dim: 768             # Hidden dimension across the backbone
+  latent_size: 64            
+  in_channels: 4             
+  patch_size: 2              
+  embed_dim: 768             
   
   # Hierarchical Stages
-  depths: [2, 2, 6, 2]       # Blocks in each hierarchical stage
-  num_heads: [3, 6, 12, 24]  # Heads scale to handle complexity
-  window_size: 8             # Local attention window
+  depths: [2, 2, 6, 2]       
+  num_heads: [3, 6, 12, 24]  
+  window_size: 8             
   
   # Novel Research Contribution
-  use_pswa_bridge: true      # Toggle the Parallel Pseudo-Shifted Window Bridge
-  bridge_alpha: 0.5          # Weighting for high-frequency restoration
+  use_pswa_bridge: true      
+  bridge_alpha: 0.5          
 
 diffusion:
-  num_sampling_steps: 1000   # Standard DDPM/IDDPM steps
-  noise_schedule: "linear"   # Can be 'linear' or 'cosine'
-  prediction_type: "epsilon" # Predicting noise (eps) vs. starting image (x0)
+  num_sampling_steps: 1000   
+  noise_schedule: "linear"   
+  prediction_type: "epsilon"
 
 training:
   learning_rate: 0.0001
-  precision: "fp32"          # matching VAE torch.dtype
+  precision: "fp32"         
   batch_size: 16
