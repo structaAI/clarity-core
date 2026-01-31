@@ -1,3 +1,4 @@
+# Imports
 import torch
 import torchvision.transforms as T
 from torchmetrics.image.psnr import PeakSignalNoiseRatio as psnr
@@ -8,13 +9,15 @@ import numpy as np
 from PIL import Image
 from diffusers import AutoencoderKL # type: ignore
 
-
+# General Definitions
 BASE_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIRECTORY, "saved_models")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Initialize VAE identifier
 vae=None
 
+# Loading the VAE model from Local Storage (Safe Tensor Format)
 try:
   vae = AutoencoderKL.from_pretrained(
     MODEL_PATH, 
@@ -24,6 +27,12 @@ try:
 except Exception as e:
   print(f"Error Loading VAE: {e}")
 
+"""
+To Ensure Proper Setup of the Variational Autoencoder (VAE)
+
+- Input: Dummy Tensor to simulate an image patch
+- Output: Confirmation of Latent Generation (Lower dimension Latent Vector that is being mapped in said Latent Space)
+"""
 def verify_vae_setup():
   dummy_input = torch.randn(1, 3, 512, 512).to(DEVICE, dtype=torch.float32)
 
@@ -32,6 +41,20 @@ def verify_vae_setup():
     latents = output.latent_dist.sample() # pyright: ignore[reportAttributeAccessIssue]
     print(f"Successfully generated latents with shape: {latents.shape}")
 
+"""
+To Run Fidelity Tests on the VAE Model
+
+- Input: Image Tensor
+- Output: PSNR and SSIM Metrics
+
+Here we First Encode the Image into the Latent Space --> A Higher Dimension Patch is Mapped to Lower Dimension Latent Vector
+In this process, the model intends to learn necessary features to represent the image effectively.
+
+Then we Decode the Latent Vector back to Image Space --> The Model Reconstructs the Image from the Latent Representation
+
+Main aim is to evaluate how well the VAE can reconstruct the original image from its latent representation.
+Which is done via PSNR and SSIM Metrics.
+"""
 def run_fidelity_test(img_tensor):
   with torch.no_grad():
 
@@ -59,13 +82,14 @@ def run_fidelity_test(img_tensor):
     return psnr_val, ssim_val
 
 if __name__ == "__main__":
-  test_img_path = "<File of Your Choice>.png"
+  test_img_path = "<File of Your Choice>.png" # Placeholder Value
   
   if not os.path.exists(test_img_path):
     print(f"Error: {test_img_path} not found in {os.getcwd()}")
   else:
     img = Image.open(test_img_path).convert("RGB")
 
+    # This is to flatten and resize the image to 512x512 for VAE input
     transform = T.Compose([
       T.Resize((512, 512)),
       T.ToTensor(),
@@ -77,6 +101,7 @@ if __name__ == "__main__":
     print(f"Running metrics on {test_img_path}...")
     psnr_value, ssim_value = run_fidelity_test(input_tensor)
 
+    # Final Results (PSNR and SSIM)
     print("-" * 30)
     print(f"Results for {test_img_path}:")
     print(f"PSNR: {psnr_value:.2f} dB")
