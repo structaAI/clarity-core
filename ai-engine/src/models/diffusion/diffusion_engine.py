@@ -1,9 +1,18 @@
-# 
-
+# Imports
 import torch
 import numpy as np
 from typing import Optional, Literal
 
+"""
+Gaussian Diffusion Scheduler
+
+--Parameters--
+- @num_timesteps: int: Number of Time Steps (default: 1000)
+- @schedule: Literal[str, ...]: What type of schedule is being used for Noise Scheduling (default: linear)
+
+--Returns--
+
+"""
 class GaussianDiffusion:
   def __init__(self, num_timesteps: int = 1000, schedule: Literal['linear', 'cosine'] = 'linear') -> None:
     self.num_timesteps = num_timesteps
