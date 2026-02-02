@@ -17,3 +17,7 @@ pre_run_checks.py
 saved_models/
 *.safetensors
 config.json
+
+# Dataset Related Folders
+raw_datasets/
+test_datasets/
