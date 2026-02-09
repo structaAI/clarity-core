@@ -28,7 +28,7 @@ This is inspired from the positional encoding used in Transformer models
 Note: 10000 is a scaling factor that helps in spreading out the embeddings (Decided via Experiments)
 """
 class TimeStepEmbedding(nn.Module):
-  def __init__(self, hidden_size: int, frequency_embedding_size: int = 256)-> None:
+  def __init__(self, hidden_size: int, frequency_embedding_size: int = 256, num_degradation_types: int = 5)-> None:
     super().__init__()
 
     # Initializing Parameters for Instance
@@ -46,6 +46,22 @@ class TimeStepEmbedding(nn.Module):
       nn.Linear(self.frequency_embedding_size, self.hidden_size),
       nn.SiLU(),
       nn.Linear(self.hidden_size, self.hidden_size),
+    )
+
+    self.type_embeddings = nn.Embedding(num_degradation_types, hidden_size)
+
+    # 3. Component: Severity (s_σ)
+    # Projects a scalar severity value [0, 1] into the embedding space.
+    self.severity_encoder = nn.Sequential(
+        nn.Linear(1, hidden_size // 4),
+        nn.SiLU(),
+        nn.Linear(hidden_size // 4, hidden_size)
+    )
+
+    # 4. Component: Tripartite Fusion via Cross-Attention
+    # Allows the model to attend to the most relevant conditioning signal.
+    self.fusion_attention = nn.MultiheadAttention(
+        hidden_size, num_heads=8, batch_first=True
     )
   
   def forward(self, x: torch.Tensor)-> torch.Tensor:

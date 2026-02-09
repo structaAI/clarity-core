@@ -80,7 +80,14 @@ class SwinBlock(nn.Module):
     self.attention: nn.MultiheadAttention = nn.MultiheadAttention(dim, num_heads=num_heads, batch_first=True)
     # Layer Normalization
     self.norm1: nn.LayerNorm = nn.LayerNorm(dim)
-    # PSWA Bridge
+    self.norm2: nn.LayerNorm = nn.LayerNorm(dim)
+
+    # Feed-Forward Network
+    self.mlp = nn.Sequential(
+      nn.Linear(dim, dim * 4),
+      nn.GELU(),
+      nn.Linear(dim * 4, dim)
+    )
 
     # To switch between the Static and Adaptive PSWA Bridges
     match(bridge_type):
@@ -126,6 +133,14 @@ class SwinBlock(nn.Module):
 
     # Checking the bridge flag variable
     if self.bridge is not None:
-      x = self.bridge(x)
+      # Check instance to ensure compatibility with Adaptive logic
+      if isinstance(self.bridge, AdaptivePSWABridge):
+          # Passes t_embed to guide frequency-aware gating
+        x = self.bridge(x, t_embed)
+      else:
+        x = self.bridge(x)
+
+    # Final MLP Refinement Path
+    x = x + self.mlp(self.norm1(x))
 
     return x
