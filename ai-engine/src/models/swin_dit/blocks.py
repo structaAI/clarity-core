@@ -6,6 +6,7 @@ from typing import Optional
 
 # Dependency Imports
 from .utils import window_partition, window_reverse
+from .adaptive_backbone import AdaptivePSWABridge
 
 """
 Pseudo-Shifted Window Attention(PSWA)
@@ -66,7 +67,7 @@ Over here, we define a bridge module that extracts high-frequency features from 
    attention layers.
 """
 class SwinBlock(nn.Module):
-  def __init__(self, dim: int, num_heads: int, window_size: int = 8, shifted: bool = False, use_pswa_bridge: bool = False)-> None:
+  def __init__(self, dim: int, num_heads: int, window_size: int = 8, shifted: bool = False, use_pswa_bridge: bool = False, bridge_type: Optional[str] = None)-> None:
     super().__init__()
 
     # Defining Parameters for instance in constructor
@@ -80,7 +81,13 @@ class SwinBlock(nn.Module):
     # Layer Normalization
     self.norm1: nn.LayerNorm = nn.LayerNorm(dim)
     # PSWA Bridge
-    self.bridge: Optional[PSWABridge] = PSWABridge(dim) if use_pswa_bridge else None
+
+    # To switch between the Static and Adaptive PSWA Bridges
+    match(bridge_type):
+      case "adaptive":
+        self.bridge = AdaptivePSWABridge(dim) if use_pswa_bridge else None
+      case _:
+        self.bridge = PSWABridge(dim) if use_pswa_bridge else None
   
   def forward(self, x: torch.Tensor, t_embed: torch.Tensor, H: int, W: int)-> torch.Tensor:
     # Adding Time Step Embeddings to input tensor
