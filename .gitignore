@@ -21,3 +21,7 @@ config.json
 # Dataset Related Folders
 raw_datasets/
 test_datasets/
+raw/
+clean_train/
+
+# Additional
