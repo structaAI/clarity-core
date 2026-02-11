@@ -8,10 +8,10 @@ Successfully managed to develop and test the VAE, SwinDiT and the Gaussian Diffu
 
 Objectives for Next Week
 
-1. Complete Report for Review 2
-2. Complete Presentation for Review 2
-3. Check additional Components
-4. Integration of Components
-5. EDA
-6. Training models on Individual Datasets
-7. Training on Integrated Dataset
+
+1. Check additional Components
+2. Integration of Components
+3. EDA
+4. Training models on Individual Datasets
+5. Training on Integrated Dataset
+6. Edit Pushed Draft on Overleaf (Make Personal Project for editing)
