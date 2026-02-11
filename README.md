@@ -8,7 +8,6 @@ Successfully managed to develop and test the VAE, SwinDiT and the Gaussian Diffu
 
 Objectives for Next Week
 
-
 1. Check additional Components
 2. Integration of Components
 3. EDA
