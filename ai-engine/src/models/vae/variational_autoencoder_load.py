@@ -6,7 +6,7 @@ from diffusers import AutoencoderKL # type: ignore
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Huggingface Model Card Information for VAE
-MODEL_CARD_INFO = "stabilityai/sdxl-vae"
+MODEL_CARD_INFO = "stabilityai/sdxl-vae" 
 
 try:
   # Loading the VAE model from Huggingface Hub
