@@ -8,8 +8,11 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from datasets.auth_swin_dataset import AuthSwinDataset
-from models.swin_dit import AuthReasoningTransformer # type: ignore
-from configs import swin_dit_config # type: ignore
+
+from models.swin_dit.backbone import SwinDiT
+from utils.config_manager_swin_dit import load_config
+  
+swin_dit_config = load_config("configs/swin_dit_config.yaml")
 
 def train():
   # 1. Init Accelerator (Handles BF16 and Checkpoints)
@@ -17,7 +20,7 @@ def train():
   
   # 2. Setup Model & Optimizer
   # Note: Ensure your config is defined or passed here
-  model = AuthReasoningTransformer(swin_dit_config)
+  model = SwinDiT(swin_dit_config)
   optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
   
   # 3. Data
