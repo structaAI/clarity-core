@@ -141,6 +141,6 @@ class SwinBlock(nn.Module):
         x = self.bridge(x)
 
     # Final MLP Refinement Path
-    x = x + self.mlp(self.norm1(x))
+    x = x + self.mlp(self.norm2(x))
 
     return x

@@ -53,15 +53,15 @@ class TimeStepEmbedding(nn.Module):
     # 3. Component: Severity (s_σ)
     # Projects a scalar severity value [0, 1] into the embedding space.
     self.severity_encoder = nn.Sequential(
-        nn.Linear(1, hidden_size // 4),
-        nn.SiLU(),
-        nn.Linear(hidden_size // 4, hidden_size)
+      nn.Linear(1, hidden_size // 4),
+      nn.SiLU(),
+      nn.Linear(hidden_size // 4, hidden_size)
     )
 
     # 4. Component: Tripartite Fusion via Cross-Attention
     # Allows the model to attend to the most relevant conditioning signal.
     self.fusion_attention = nn.MultiheadAttention(
-        hidden_size, num_heads=8, batch_first=True
+      hidden_size, num_heads=8, batch_first=True
     )
   
   def forward(self, x: torch.Tensor)-> torch.Tensor:
