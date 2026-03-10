@@ -4,8 +4,10 @@ from collections import OrderedDict
 from layer_norm import LayerNorm
 from quick_gelu import QuickGELU
 
+from typing import Optional
+
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+    def __init__(self, d_model: int, n_head: int, attn_mask: Optional[torch.Tensor] = None):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
