@@ -68,7 +68,11 @@ class TimeStepEmbedding(nn.Module):
     half_dim = self.frequency_embedding_size // 2
 
     # Defining the freqency Formula as seen above
-    freqs = torch.exp(-math.log(10000) * torch.arange(0, half_dim, device=x.device)/half_dim)
+    freqs = torch.exp(-math.log(10000) * torch.arange(0, half_dim, device=x.device).float() / half_dim)
+
+    if x.ndim == 0:
+      x = x.unsqueeze(0)
+
     args = x[:, None].float() * freqs[None, :]
 
     # Concatenating the Sine and Cosine Embeddings

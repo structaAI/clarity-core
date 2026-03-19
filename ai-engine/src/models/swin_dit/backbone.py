@@ -1,6 +1,7 @@
 # Imports
 import torch
 import torch.nn as nn
+from typing import Optional
 
 # Dependency Imports
 from .layers import TimeStepEmbedding, SwinPatchEmbed
@@ -54,7 +55,7 @@ class SwinDiT(nn.Module):
     self.final_layer: nn.Linear = nn.Linear(c.embed_dim, c.patch_size** 2 * c.in_channels)
   
   # Forward Pass through the SwinDiT Model
-  def forward(self, x: torch.Tensor, t: torch.Tensor)-> torch.Tensor:
+  def forward(self, x: torch.Tensor, t: Optional[torch.Tensor] = None)-> torch.Tensor:
 
     x , (H, W)= self.patch_embedding(x) # Dimmension: 2 --> torch.Tensor, Tuple[int, int]
     t_feature = self.time_embedding(t) # Time Step Features
