@@ -27,7 +27,7 @@ Training Loop for SwinDiT:
 
 Dataset: 
 - COCO image dataset (HR-LR pairs)
-- Dataset Size: 11827 images (each)
+- Dataset Size: 118227 images (each)
 - Total Epochs: 100
 
 General
