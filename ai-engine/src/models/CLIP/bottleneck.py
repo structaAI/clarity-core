@@ -1,12 +1,16 @@
 import torch
 from torch import nn
 from collections import OrderedDict
+from typing import Optional
+
 
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1):
+    def __init__(self, inplanes: int, planes: int, stride: int = 1) -> None:
         super().__init__()
+
+        # All conv layers have stride 1; avgpool is inserted after conv2 when stride > 1.
         self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu1 = nn.ReLU(inplace=True)
@@ -21,18 +25,19 @@ class Bottleneck(nn.Module):
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
         self.relu3 = nn.ReLU(inplace=True)
 
-        self.downsample = None
+        self.downsample: Optional[nn.Module] = None
         self.stride = stride
 
         if stride > 1 or inplanes != planes * Bottleneck.expansion:
             self.downsample = nn.Sequential(OrderedDict([
                 ("-1", nn.AvgPool2d(stride)),
                 ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False)),
-                ("1", nn.BatchNorm2d(planes * self.expansion))
+                ("1", nn.BatchNorm2d(planes * self.expansion)),
             ]))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
+
         out = self.relu1(self.bn1(self.conv1(x)))
         out = self.relu2(self.bn2(self.conv2(out)))
         out = self.avgpool(out)

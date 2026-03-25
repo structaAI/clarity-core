@@ -1,29 +1,34 @@
 import torch
-from torch import nn
+import torch.nn as nn
 from collections import OrderedDict
-from layer_norm import LayerNorm
-from quick_gelu import QuickGELU
+from typing import Optional, Any
 
-from typing import Optional
+from .layer_norm import LayerNorm
+from .quick_gelu import QuickGELU
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: Optional[torch.Tensor] = None):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, n_head)
-        self.ln_1 = LayerNorm(d_model)
-        self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, d_model * 4)),
-            ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(d_model * 4, d_model))
-        ]))
-        self.ln_2 = LayerNorm(d_model)
-        self.attn_mask = attn_mask
+  def __init__(self, d_model: int, n_heads: int, attn_mask: Optional[torch.Tensor] = None)-> None:
+    super().__init__()
+    self.attn: Any = nn.MultiheadAttention(d_model, n_heads)
+    self.ln_1 = LayerNorm(d_model)
+    self.mlp = nn.Sequential(OrderedDict([
+      ("c_fc",  nn.Linear(d_model, d_model * 4)),
+      ("gelu",  QuickGELU()),
+      ("c_proj", nn.Linear(d_model * 4, d_model)),
+    ]))
+    self.ln_2 = LayerNorm(d_model)
+    self.attn_mask = attn_mask
 
-    def attention(self, x: torch.Tensor):
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+  def attention(self, x: torch.Tensor)-> torch.Tensor:
+    self.attn_mask: Optional[torch.Tensor] = (
+      self.attn_mask.to(dtype=x.dtype, device=x.device)
+      if self.attn_mask is not None
+      else None
+    )
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+    return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+  
+  def forward(self, x: torch.Tensor)-> torch.Tensor:
+    x = x + self.attention(self.ln_1(x))
+    x = x + self.mlp(self.ln_2(x))
+    return x
