@@ -1,7 +1,8 @@
 import torch
 from torch import nn
-from layer_norm import LayerNorm
-from transformer import Transformer
+
+from .layer_norm import LayerNorm  
+from .transformer import Transformer
 
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
