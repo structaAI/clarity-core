@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from .bottleneck import Bottleneck
+from .resnet_bottleneck import Bottleneck
 from .attention_pool import AttentionPool2d
 
 class ModifiedResNet(nn.Module):
