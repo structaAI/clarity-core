@@ -2,7 +2,31 @@
 import torch
 import torch.nn as nn
 import math
-from typing import Tuple
+from typing import Tuple, Optional
+
+
+"""
+CLIP Projection MLP
+ 
+Maps CLIP output embeddings (768 or 1024 dim) into the model's hidden dimension
+so they can be fused with the time embedding before AdaLN conditioning.
+ 
+--Parameters--
+- @clip_dim: int: Output dimension of the CLIP encoder (e.g. 768 for ViT-L/14)
+- @model_dim: int: Hidden dimension of the SwinDiT backbone (embed_dim in config)
+"""
+class CLIPProjection(nn.Module):
+  def __init__(self, clip_dim: int, model_dim: int) -> None:
+    super().__init__()
+
+    self.proj: nn.Sequential = nn.Sequential(
+      nn.Linear(clip_dim, model_dim),
+      nn.SiLU(),
+      nn.Linear(model_dim, model_dim)
+    )
+
+  def forward(self, clip_embed: torch.Tensor) -> torch.Tensor:
+    return self.proj(clip_embed)
 
 
 """
@@ -64,22 +88,51 @@ class TimeStepEmbedding(nn.Module):
       hidden_size, num_heads=8, batch_first=True
     )
   
-  def forward(self, x: torch.Tensor)-> torch.Tensor:
+  def _sinusoidal_embed(self, t: torch.Tensor) -> torch.Tensor:
     half_dim = self.frequency_embedding_size // 2
+    freqs = torch.exp(
+      -math.log(10000)
+      * torch.arange(0, half_dim, device=t.device).float()
+      / half_dim
+    )
 
-    # Defining the freqency Formula as seen above
-    freqs = torch.exp(-math.log(10000) * torch.arange(0, half_dim, device=x.device).float() / half_dim)
+    if t.ndim == 0:
+      t = t.unsqueeze(0)
 
-    if x.ndim == 0:
-      x = x.unsqueeze(0)
+    args = t[:, None].float() * freqs[None, :]
+    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+  
+  def forward(self, t: torch.Tensor, clip_embeddings: Optional[torch.Tensor] = None, degradation_type: Optional[torch.Tensor] = None, severity: Optional[torch.Tensor] = None) -> torch.Tensor:
+    
+    # 1. Base Timestep Embedding (The "Clock")
+    t_freq = self._sinusoidal_embed(t)        
+    t_embed = self.mlp(t_freq)                # [B, hidden_size]
 
-    args = x[:, None].float() * freqs[None, :]
+    # 2. Build the Token Sequence for Fusion
+    tokens = [t_embed.unsqueeze(1)]           # [B, 1, hidden_size]
 
-    # Concatenating the Sine and Cosine Embeddings
-    x_freq = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+    # NEW: Add CLIP Conditioning
+    if clip_embeddings is not None:
+      # self.clip_proj maps [B, 768] -> [B, hidden_size]
+      c_embed = self.clip_proj(clip_embeddings) 
+      tokens.append(c_embed.unsqueeze(1))
 
-    # Return the MLP output
-    return self.mlp(x_freq)
+    # Add Auxiliary Signals (Degradation info)
+    if degradation_type is not None:
+      type_embed = self.type_embeddings(degradation_type) 
+      tokens.append(type_embed.unsqueeze(1))
+
+    if severity is not None:
+      sev_input = severity.float().unsqueeze(-1)            
+      sev_embed = self.severity_encoder(sev_input)          
+      tokens.append(sev_embed.unsqueeze(1))
+
+    token_seq = torch.cat(tokens, dim=1)     
+    query = t_embed.unsqueeze(1)              
+    
+    fused, _ = self.fusion_attention(query, token_seq, token_seq)
+
+    return fused.squeeze(1) # Final conditioning vector [B, hidden_size]
 
 
 """
