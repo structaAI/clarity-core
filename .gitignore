@@ -24,4 +24,5 @@ test_datasets/
 raw/
 clean_train/
 
-# Additional
+# Model Checpoints
+checkpoints/
