@@ -14,7 +14,7 @@ from src.training.mini_model_integrated_training import load_config
 
 # --- SETUP ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config/model_config.yaml")
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/swin_dit_config.yaml")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "../../experiments/auth_swindiff_demo.pt")
 
 config = load_config(CONFIG_PATH)
