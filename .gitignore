@@ -23,6 +23,9 @@ raw_datasets/
 test_datasets/
 raw/
 clean_train/
+annotations/
+train2017/
+latents/
 
 # Model Checpoints
 checkpoints/
