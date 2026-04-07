@@ -1,0 +1,65 @@
+import torch
+import numpy as np
+from torch import Tensor
+from torch.utils.data import Dataset
+from pycocotools.coco import COCO
+from PIL import Image
+import os
+import random
+from typing import Any, Dict, List, Tuple, Optional, Callable, Sequence
+
+class CocoAuthDataset(Dataset):
+    def __init__(self, img_dir: str, ann_file: str, transform: Optional[Callable] = None, degradation_pipeline: Optional[Callable] = None) -> None:
+        self.coco: COCO = COCO(ann_file)
+        self.ids: List[int] = list(self.coco.imgs.keys())
+        self.img_dir: str = img_dir
+        self.transform: Optional[Callable] = transform
+        self.degrade: Optional[Callable] = degradation_pipeline
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        img_id: int = self.ids[index]
+        img_info: Any = self.coco.loadImgs(img_id)[0]
+        path: str = img_info['file_name']
+        
+        hr_img: Image.Image = Image.open(os.path.join(self.img_dir, path)).convert('RGB')
+        
+        # 1. Get Caption with Safety Guard
+        ann_ids: List[int] = self.coco.getAnnIds(imgIds=img_id)
+        anns: Sequence[Any] = self.coco.loadAnns(ann_ids)
+        
+        if not anns:
+            caption: str = "A photograph" # Default fallback
+        else:
+            selected_ann: Dict[str, Any] = dict(random.choice(anns))
+            caption = str(selected_ann.get('caption', "A photograph"))
+
+        # 2. Apply degradation
+        if self.degrade:
+            # Important: Ensure your pipeline handles PIL and returns (Tensor/PIL, Int, Float)
+            lr_img, deg_id, severity = self.degrade(hr_img)
+        else:
+            lr_img, deg_id, severity = hr_img, 0, 0.0
+
+        # 3. Safe Tensor Conversion
+        if self.transform:
+            hr_tensor: Tensor = self.transform(hr_img)
+            # Only transform lr_img if it's not already a Tensor from the pipeline
+            lr_tensor: Tensor = self.transform(lr_img) if not isinstance(lr_img, Tensor) else lr_img
+        else:
+            # Manual conversion if no transforms provided (scaling to 0-1)
+            hr_tensor = torch.from_numpy(np.array(hr_img)).permute(2, 0, 1).float() / 255.0
+            if isinstance(lr_img, Tensor):
+                lr_tensor = lr_img
+            else:
+                lr_tensor = torch.from_numpy(np.array(lr_img)).permute(2, 0, 1).float() / 255.0
+
+        return {
+            "hr": hr_tensor,
+            "lr": lr_tensor,
+            "caption": caption,
+            "deg_id": torch.tensor(deg_id, dtype=torch.long),
+            "severity": torch.tensor([severity], dtype=torch.float32)
+        }
