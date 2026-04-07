@@ -34,35 +34,57 @@ class SwinDiT(nn.Module):
     c = config.model
 
     # 1. Patch partition
-    self.patch_embedding: SwinPatchEmbed = SwinPatchEmbed(patch_size=c.patch_size, no_of_in_channels=c.in_channels, embed_dim=c.embed_dim)
+    self.patch_embedding: SwinPatchEmbed = SwinPatchEmbed(
+      patch_size=c.patch_size,
+      no_of_in_channels=c.in_channels,
+      embed_dim=c.embed_dim,
+    )
 
     # 2. Timestep + conditioning embedding
-    self.time_embedding: TimeStepEmbedding = TimeStepEmbedding(hidden_size=c.embed_dim)
+    self.time_embedding: TimeStepEmbedding = TimeStepEmbedding(
+        hidden_size=c.embed_dim
+    )
+
+    # FIX: build per-stage head list matching the depths config so each
+    # block gets the correct number of attention heads for its stage.
+    # Previously ALL blocks used c.num_heads[0] (always 3 heads).
+    #
+    # Example: depths=[2,2,6,2], num_heads=[3,6,12,24]
+    #   → blocks 0-1  use 3  heads  (stage 0, depth 2)
+    #   → blocks 2-3  use 6  heads  (stage 1, depth 2)
+    #   → blocks 4-9  use 12 heads  (stage 2, depth 6)
+    #   → blocks 10-11 use 24 heads (stage 3, depth 2)
+    heads_per_block = []
+    for stage_idx, depth in enumerate(c.depths):
+      heads_per_block.extend([c.num_heads[stage_idx]] * depth)
+
+    bridge_type = getattr(c, "bridge_type", None)   # e.g. "adaptive" or None
 
     # 3. Swin blocks — alternating regular / shifted windows
     self.blocks: nn.ModuleList = nn.ModuleList([
       SwinBlock(
         dim=c.embed_dim,
-        num_heads=c.num_heads[0],
+        num_heads=heads_per_block[i],  
         window_size=c.window_size,
         shifted=(i % 2 != 0),
         use_pswa_bridge=c.use_pswa_bridge,
+        bridge_type=bridge_type,          
       )
       for i in range(sum(c.depths))
     ])
 
     # 4. Output projection: tokens → flattened patch pixels
     self.final_layer: nn.Linear = nn.Linear(
-      c.embed_dim, c.patch_size ** 2 * c.in_channels
+        c.embed_dim, c.patch_size ** 2 * c.in_channels
     )
 
   def forward(
-    self,
-    x: torch.Tensor,
-    t: Optional[torch.Tensor] = None,
-    clip_embeddings: Optional[torch.Tensor] = None,
-    degradation_type: Optional[torch.Tensor] = None,
-    severity: Optional[torch.Tensor] = None,
+      self,
+      x: torch.Tensor,
+      t: Optional[torch.Tensor] = None,
+      clip_embeddings: Optional[torch.Tensor] = None,
+      degradation_type: Optional[torch.Tensor] = None,
+      severity: Optional[torch.Tensor] = None,
   ) -> torch.Tensor:
     """
     Parameters
