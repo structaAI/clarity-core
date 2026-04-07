@@ -6,7 +6,6 @@ from PIL import Image
 import os
 import sys
 
-# Since it's in src/training/, we add the root 'src' to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from src.models.swin_dit.backbone import SwinDiT
@@ -67,7 +66,7 @@ def restore_image(input_img, prompt, deg_type):
 
 # --- UI ---
 with gr.Blocks(title="Auth-SwinDiff Demo") as demo:
-  gr.Markdown("# 🎨 Auth-SwinDiff: Generative Restoration")
+  gr.Markdown("# Auth-SwinDiff: Generative Restoration")
   with gr.Row():
     with gr.Column():
       in_img = gr.Image(type="pil", label="Input")
