@@ -54,6 +54,12 @@ class AuthBridge(nn.Module):
     nn.init.zeros_(self.gate_fc.weight)
     nn.init.zeros_(self.gate_fc.bias)
 
+    self.time_mlp = nn.Sequential(
+      nn.Linear(1, output_dim),  # Scalar → vector
+      nn.SiLU(),
+      nn.Linear(output_dim, output_dim),
+    ) if cond_dim == 1 else None
+
   def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Parameters
@@ -72,14 +78,10 @@ class AuthBridge(nn.Module):
     projected = self.proj(x)  # [B, N, D]
 
     if cond is not None:
-      # [B, D] → unsqueeze → [B, 1, D] for broadcast over N
+      if self.time_mlp is not None:
+        cond = self.time_mlp(cond.unsqueeze(-1))  # [B] → [B, 1] → [B, D]
       gate = torch.sigmoid(self.gate_fc(cond)).unsqueeze(1)
     else:
-      gate = torch.full(
-        (x.size(0), 1, x.size(-1)),
-        fill_value=0.5,
-        dtype=x.dtype,
-        device=x.device,
-      )
+        gate = 0.5
 
     return x + gate * projected
