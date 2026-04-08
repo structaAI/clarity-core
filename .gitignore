@@ -29,3 +29,9 @@ latents/
 
 # Model Checpoints
 checkpoints/
+
+# Model experiments
+experiments/
+
+# Gradio UI Files
+.gradio/
