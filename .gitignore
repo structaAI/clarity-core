@@ -19,12 +19,15 @@ saved_models/
 config.json
 
 # Dataset Related Folders
+data/
 raw_datasets/
 test_datasets/
 raw/
 clean_train/
 annotations/
 train2017/
+train2017_lr/
+val2017/
 latents/
 
 # Model Checpoints
