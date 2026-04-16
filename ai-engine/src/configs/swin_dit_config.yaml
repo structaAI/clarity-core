@@ -3,7 +3,7 @@
 model:
   name: "Auth-SwinDiff-V1"
   latent_size: 64            
-  in_channels: 4             
+  in_channels: 8             
   patch_size: 2              
   embed_dim: 768             
   
@@ -23,4 +23,4 @@ diffusion:
 training:
   learning_rate: 0.0001
   precision: "fp32"         
-  batch_size: 1
+  batch_size: 8
