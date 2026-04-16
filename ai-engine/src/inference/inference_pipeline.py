@@ -1,46 +1,22 @@
-"""
-InferencePipeline — Unified orchestrator for conditional and unconditional
-image denoising and super-resolution.
-
-Public API
-----------
-    pipeline = InferencePipeline.from_config("configs/swin_dit_config.yaml")
-
-    # Mode A: Unconditional denoising (pure noise → clean latent)
-    latent = pipeline.denoise(batch_size=1)
-
-    # Mode B: Unconditional SR (LR image → HR latent)
-    latent = pipeline.super_resolve(lr_image)
-
-    # Mode C: Text-conditioned SR
-    latent = pipeline.super_resolve(lr_image, prompt="sharp building facade")
-
-    # Mode D: Fully conditioned SR (text + degradation metadata)
-    latent = pipeline.super_resolve(
-        lr_image,
-        prompt="sharp building facade",
-        degradation_type=0,   # e.g. 0 = blur
-        severity=0.7,
-    )
-
-    # When lr_image is already a VAE latent tensor (e.g. from cache):
-    latent = pipeline.super_resolve(lr_latent, lr_is_latent=True)
-
-    # Decode any latent to a PIL image
-    image = pipeline.decode_latent(latent)
-"""
-
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from pathlib import Path
 from typing import Callable, Optional, Union
 
 import torch
 import torchvision.transforms as T
 from PIL import Image
-from diffusers import AutoencoderKL  # type: ignore
-from transformers import AutoModel, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase  # type: ignore
+from diffusers import AutoencoderKL
+from transformers import AutoModel, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from dotenv import load_dotenv
+
+# 1. Path Management: Ensure we can see 'src'
+project_root = Path(__file__).resolve().parents[2]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 from src.models.diffusion.diffusion_engine import GaussianDiffusion
 from src.models.swin_dit.backbone import SwinDiT
@@ -49,78 +25,34 @@ from src.utils.pipeline_config import PipelineConfig
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Helper: resolve torch dtype
-# ---------------------------------------------------------------------------
-
-_DTYPE_MAP = {
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
-}
-
+# --- Helper Utilities ---
 
 def _resolve_dtype(name: str) -> torch.dtype:
-    if name not in _DTYPE_MAP:
-        raise ValueError(f"Unsupported dtype '{name}'. Choose from {list(_DTYPE_MAP)}")
-    return _DTYPE_MAP[name]
+    _DTYPE_MAP = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    return _DTYPE_MAP.get(name, torch.float32)
 
-
-# ---------------------------------------------------------------------------
-# Image ↔ Tensor utilities
-# ---------------------------------------------------------------------------
-
-def _image_to_tensor(
-    image: Union[Image.Image, torch.Tensor],
-    size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
+def _image_to_tensor(image: Union[Image.Image, torch.Tensor], size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     if isinstance(image, torch.Tensor):
         t = image.to(device=device, dtype=dtype)
-        if t.ndim == 3:
-            t = t.unsqueeze(0)
+        if t.ndim == 3: t = t.unsqueeze(0)
         return t
-
+    
     transform = T.Compose([
         T.Resize((size, size), interpolation=T.InterpolationMode.LANCZOS),
         T.ToTensor(),
-        T.Normalize([0.5], [0.5]),
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
-    return transform(image.convert("RGB")).unsqueeze(0).to(device=device, dtype=dtype)  # type: ignore
-
+    return transform(image.convert("RGB")).unsqueeze(0).to(device=device, dtype=dtype)
 
 def _tensor_to_image(t: torch.Tensor) -> Image.Image:
-    if t.ndim == 4:
-        t = t.squeeze(0)
-    t = ((t.cpu().float().clamp(-1, 1) + 1.0) * 127.5).byte()
+    if t.ndim == 4: t = t.squeeze(0)
+    # Clamp and convert from [-1, 1] back to [0, 255]
+    t = ((t.cpu().float().detach().clamp(-1, 1) + 1.0) * 127.5).byte()
     return T.ToPILImage()(t)
 
-
-# ---------------------------------------------------------------------------
-# InferencePipeline
-# ---------------------------------------------------------------------------
+# --- InferencePipeline ---
 
 class InferencePipeline:
-    """
-    Unified inference pipeline for SwinDiT + GaussianDiffusion.
-
-    Parameters
-    ----------
-    denoiser : SwinDiT
-        The trained denoiser backbone.
-    diffusion : GaussianDiffusion
-        Scheduler with matching num_timesteps and noise_schedule.
-    config : PipelineConfig
-        Runtime configuration (paths, device, precision, …).
-    vae : AutoencoderKL, optional
-        VAE for pixel-space encode / decode.
-    clip_model : AutoModel, optional
-        CLIP / SigLIP encoder for text conditioning.
-    clip_tokenizer : AutoTokenizer, optional
-        Tokenizer for the CLIP model.
-    """
-
     def __init__(
         self,
         denoiser: SwinDiT,
@@ -140,278 +72,132 @@ class InferencePipeline:
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         self.dtype = _resolve_dtype(config.dtype)
 
+        # Move Denoiser and CLIP to requested dtype (e.g., bfloat16)
         self.denoiser.to(self.device, self.dtype).eval()
-        if self.vae is not None:
-            self.vae.to(self.device, self.dtype).eval() # type: ignore
         if self.clip_model is not None:
-            self.clip_model.to(self.device, self.dtype).eval() # type: ignore
+            self.clip_model.to(self.device, self.dtype).eval()
 
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
+        # VAE is forced to Float32 for numerical stability and bias-type matching
+        if self.vae is not None:
+            self.vae.to(self.device, torch.float32).eval()
+            print("⚙️ VAE initialized in Float32 mode for precision.")
 
     @classmethod
     def from_config(cls, config_path: str) -> "InferencePipeline":
-        """
-        Build the full pipeline from a YAML config path.
-        """
-        cfg = PipelineConfig.from_yaml(config_path)
-        cfg.validate()
+        # Load environment variables from .env.local
+        dotenv_path = project_root / ".env.local"
+        if dotenv_path.exists():
+            load_dotenv(dotenv_path=dotenv_path)
+            print(f"✅ Loaded environment from: {dotenv_path}")
 
+        cfg = PipelineConfig.from_yaml(config_path)
         swin_config = load_config(config_path)
 
+        # 1. Initialize Components
         denoiser = SwinDiT(swin_config)
-        if cfg.swin_dit_weights:
-            state = torch.load(cfg.swin_dit_weights, map_location="cpu", weights_only=True)
-            denoiser.load_state_dict(state)
-            log.info(f"Loaded SwinDiT weights from '{cfg.swin_dit_weights}'")
-        else:
-            log.warning("No SwinDiT weights path configured — using random initialisation.")
-
         diffusion = GaussianDiffusion(
             num_timesteps=cfg.num_timesteps,
             schedule=cfg.noise_schedule,
         )
 
+        # 2. Load VAE
         vae = None
-        if cfg.vae_path:
-            try:
-                vae = AutoencoderKL.from_pretrained(cfg.vae_path, local_files_only=True)
-                log.info(f"Loaded VAE from '{cfg.vae_path}'")
-            except Exception as exc:
-                log.warning(f"Could not load VAE: {exc}. Pixel-space methods disabled.")
+        path_to_vae = getattr(cfg, "vae_path", None)
+        if path_to_vae:
+            v_path = Path(path_to_vae).resolve()
+            if v_path.exists():
+                try:
+                    vae = AutoencoderKL.from_pretrained(str(v_path), local_files_only=True)
+                    print(f"✅ VAE Loaded successfully from {v_path.name}")
+                except Exception:
+                    # Fallback to single file load
+                    weights = v_path / "diffusion_pytorch_model.safetensors"
+                    if weights.exists():
+                        vae = AutoencoderKL.from_single_file(str(weights), local_files_only=True)
+                        print(f"✅ VAE Loaded via single-file fallback.")
+            else:
+                print(f"❌ VAE Path not found: {v_path}")
 
+        # 3. Load CLIP (SigLIP)
         clip_model, clip_tokenizer = None, None
-        if cfg.clip_model_path:
-            try:
-                clip_model = AutoModel.from_pretrained(cfg.clip_model_path, local_files_only=True)
-                clip_tokenizer = AutoTokenizer.from_pretrained(
-                    cfg.clip_model_path, local_files_only=True
-                )
-                log.info(f"Loaded CLIP from '{cfg.clip_model_path}'")
-            except Exception as exc:
-                log.warning(f"Could not load CLIP: {exc}. Text conditioning disabled.")
+        path_to_clip = getattr(cfg, "clip_model_path", None)
+        if path_to_clip:
+            c_path = Path(path_to_clip).resolve()
+            if c_path.exists():
+                try:
+                    clip_model = AutoModel.from_pretrained(str(c_path), local_files_only=True)
+                    clip_tokenizer = AutoTokenizer.from_pretrained(str(c_path), local_files_only=True)
+                    print(f"✅ CLIP Loaded.")
+                except Exception as e:
+                    print(f"⚠️ CLIP load failed: {e}")
 
-        return cls(
-            denoiser=denoiser,
-            diffusion=diffusion,
-            config=cfg,
-            vae=vae,
-            clip_model=clip_model,
-            clip_tokenizer=clip_tokenizer,
-        )
-
-    # ------------------------------------------------------------------
-    # CLIP encoding
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def _encode_prompt(self, prompt: str) -> Optional[torch.Tensor]:
-        if self.clip_model is None or self.clip_tokenizer is None:
-            log.debug("CLIP not loaded — running without text conditioning.")
-            return None
-
-        inputs = self.clip_tokenizer(
-            [prompt], return_tensors="pt", padding=True, truncation=True
-        ).to(self.device)
-
-        outputs = self.clip_model(**inputs)
-
-        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-            embed = outputs.pooler_output
-        else:
-            embed = outputs.last_hidden_state[:, 0, :]
-
-        return embed.to(dtype=self.dtype)  # [1, clip_dim]
-
-    # ------------------------------------------------------------------
-    # VAE encode / decode
-    # ------------------------------------------------------------------
+        return cls(denoiser, diffusion, cfg, vae, clip_model, clip_tokenizer)
 
     def _require_vae(self) -> AutoencoderKL:
         if self.vae is None:
-            raise RuntimeError(
-                "A VAE is required for pixel-space operations. Set VAE_PATH in "
-                "your environment or pass vae= to the constructor."
-            )
+            raise RuntimeError("A VAE is required for pixel-space operations. Check VAE_PATH.")
         return self.vae
 
     @torch.no_grad()
+    def _encode_prompt(self, prompt: str) -> Optional[torch.Tensor]:
+        if not self.clip_model or not self.clip_tokenizer:
+            return None
+        inputs = self.clip_tokenizer([prompt], return_tensors="pt", padding=True).to(self.device)
+        return self.clip_model.get_text_features(**inputs).to(dtype=self.dtype)
+
+    @torch.no_grad()
     def encode_image(self, image: Union[Image.Image, torch.Tensor]) -> torch.Tensor:
-      """Encode a PIL image or RGB tensor to a VAE latent."""
-      vae = self._require_vae()
-      pixel = _image_to_tensor(image, self.config.image_size, self.device, self.dtype)
-      posterior = vae.encode(pixel).latent_dist # type: ignore
-      return posterior.sample() * self.config.vae_scale_factor
+        vae = self._require_vae()
+        # Pixels must be Float32 for the VAE
+        pixel = _image_to_tensor(image, self.config.image_size, self.device, torch.float32)
+        
+        out = vae.encode(pixel)
+        posterior = out.latent_dist if hasattr(out, 'latent_dist') else out[0]
+        
+        # Sample and then cast back to bfloat16 for the SwinDiT
+        latent = posterior.sample() * self.config.vae_scale_factor
+        return latent.to(self.dtype)
 
     @torch.no_grad()
     def decode_latent(self, latent: torch.Tensor) -> Image.Image:
-      """Decode a VAE latent to a PIL image."""
-      vae = self._require_vae()
-      latent = latent.to(device=self.device, dtype=self.dtype)
-      decoded = vae.decode(latent / self.config.vae_scale_factor).sample # type: ignore
-      return _tensor_to_image(decoded)
-
-    # ------------------------------------------------------------------
-    # Model closure builder
-    # ------------------------------------------------------------------
-
-    def _build_model_fn(
-        self,
-        clip_embeddings: Optional[torch.Tensor],
-        degradation_type: Optional[int],
-        severity: Optional[float],
-        batch_size: int,
-    ) -> Callable:
-        deg_type_tensor: Optional[torch.Tensor] = None
-        if degradation_type is not None:
-            deg_type_tensor = torch.tensor(
-                [degradation_type] * batch_size,
-                device=self.device,
-                dtype=torch.long,
-            )
-
-        severity_tensor: Optional[torch.Tensor] = None
-        if severity is not None:
-            severity_tensor = torch.tensor(
-                [severity] * batch_size,
-                device=self.device,
-                dtype=self.dtype,
-            )
-
-        def model_fn(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            return self.denoiser(
-                x_t.to(dtype=self.dtype),
-                t,
-                clip_embeddings=clip_embeddings,
-                degradation_type=deg_type_tensor,
-                severity=severity_tensor,
-            )
-
-        return model_fn
-
-    # ------------------------------------------------------------------
-    # Public inference methods
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def denoise(
-        self,
-        batch_size: int = 1,
-        prompt: Optional[str] = None,
-        degradation_type: Optional[int] = None,
-        severity: Optional[float] = None,
-        num_inference_steps: Optional[int] = None,
-        progress_callback: Optional[Callable] = None,
-    ) -> torch.Tensor:
-        """Unconditional (or conditionally guided) denoising from pure noise."""
-        clip_embed = self._encode_prompt(prompt) if prompt else None
-        if clip_embed is not None and clip_embed.shape[0] == 1 and batch_size > 1:
-            clip_embed = clip_embed.expand(batch_size, -1)
-
-        model_fn = self._build_model_fn(
-            clip_embeddings=clip_embed,
-            degradation_type=degradation_type,
-            severity=severity,
-            batch_size=batch_size,
-        )
-
-        shape = (
-            batch_size,
-            self.config.in_channels,
-            self.config.latent_size,
-            self.config.latent_size,
-        )
-
-        return self.diffusion.p_sample_loop(
-            model_fn=model_fn,
-            shape=shape,
-            device=self.device,
-            x_lr=None,
-            num_inference_steps=num_inference_steps or self.config.num_inference_steps,
-            progress_callback=progress_callback,
-        )
+        vae = self._require_vae()
+        # Decode must be in Float32
+        latent_f32 = latent.to(device=self.device, dtype=torch.float32)
+        decoded = vae.decode(latent_f32 / self.config.vae_scale_factor).sample
+        return _tensor_to_image(decoded)
 
     @torch.no_grad()
     def super_resolve(
-        self,
-        lr_image: Union[Image.Image, torch.Tensor],
-        prompt: Optional[str] = None,
-        degradation_type: Optional[int] = None,
-        severity: Optional[float] = None,
+        self, 
+        lr_image: Union[Image.Image, torch.Tensor], 
+        prompt: Optional[str] = None, 
         num_inference_steps: Optional[int] = None,
-        progress_callback: Optional[Callable] = None,
-        lr_is_latent: bool = False,    # FIX: new flag to skip VAE encoding
+        **kwargs
     ) -> torch.Tensor:
-        """
-        Super-resolve a low-resolution image.
-
-        Parameters
-        ----------
-        lr_image : PIL.Image | torch.Tensor
-            Low-resolution input. If lr_is_latent=True this must be a
-            pre-encoded latent tensor [1, 4, H, W] — no VAE is needed.
-        lr_is_latent : bool
-            Set True when passing a cached VAE latent directly (e.g. from
-            AuthSwinDataset) to avoid double-encoding through the VAE.
-
-        FIX: previously super_resolve() always called encode_image() which
-        requires a VAE. Callers with pre-encoded latents had to monkey-patch
-        the method. Now lr_is_latent=True skips the VAE entirely.
-        """
-        if lr_is_latent:
-            if not isinstance(lr_image, torch.Tensor):
-                raise TypeError(
-                    "lr_is_latent=True requires lr_image to be a torch.Tensor, "
-                    f"got {type(lr_image).__name__}."
-                )
-            x_lr = lr_image.to(device=self.device, dtype=self.dtype)
-        else:
-            x_lr = self.encode_image(lr_image)   # [1, 4, H, W]
-
-        batch_size = x_lr.shape[0]
+        # returns bfloat16
+        x_lr = self.encode_image(lr_image) if not isinstance(lr_image, torch.Tensor) else lr_image.to(self.device, self.dtype)
         clip_embed = self._encode_prompt(prompt) if prompt else None
-
-        model_fn = self._build_model_fn(
-            clip_embeddings=clip_embed,
-            degradation_type=degradation_type,
-            severity=severity,
-            batch_size=batch_size,
-        )
-
-        shape = (
-            batch_size,
-            self.config.in_channels,
-            self.config.latent_size,
-            self.config.latent_size,
-        )
+        
+        # Model closure with slicing logic
+        def model_fn(x, t):
+            x_input = torch.cat([x, x_lr], dim=1)
+            # Backbone now handles .to(dtype) internal casting
+            out = self.denoiser(x, t, clip_embeddings=clip_embed)
+            # If model predicts 8 channels, slice the first 4 for HR noise
+            if out.shape[1] == 8:
+                return out[:, :4, :, :]
+            return out
 
         return self.diffusion.p_sample_loop(
             model_fn=model_fn,
-            shape=shape,
+            shape=(x_lr.shape[0], 4, x_lr.shape[2], x_lr.shape[3]), # We only want 4ch noise
             device=self.device,
             x_lr=x_lr,
             num_inference_steps=num_inference_steps or self.config.num_inference_steps,
-            progress_callback=progress_callback,
+            **kwargs
         )
 
     @torch.no_grad()
-    def super_resolve_to_image(
-        self,
-        lr_image: Union[Image.Image, torch.Tensor],
-        prompt: Optional[str] = None,
-        degradation_type: Optional[int] = None,
-        severity: Optional[float] = None,
-        num_inference_steps: Optional[int] = None,
-        lr_is_latent: bool = False,
-    ) -> Image.Image:
-        """End-to-end convenience method: LR image → PIL HR image. Requires a loaded VAE."""
-        latent = self.super_resolve(
-            lr_image,
-            prompt=prompt,
-            degradation_type=degradation_type,
-            severity=severity,
-            num_inference_steps=num_inference_steps,
-            lr_is_latent=lr_is_latent,
-        )
+    def super_resolve_to_image(self, lr_image: Union[Image.Image, torch.Tensor], **kwargs) -> Image.Image:
+        latent = self.super_resolve(lr_image, **kwargs)
         return self.decode_latent(latent)
