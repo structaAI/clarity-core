@@ -8,6 +8,10 @@ class SwinDiT(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         c = config.model
+        
+        # FIX: Matches your checkpoint's 8-channel output (32 / patch_size^2)
+        self.out_channels = getattr(c, "out_channels", 8)
+        
         self.patch_embedding = SwinPatchEmbed(
             patch_size=c.patch_size,
             no_of_in_channels=c.in_channels,
@@ -30,25 +34,35 @@ class SwinDiT(nn.Module):
             )
             for i in range(sum(c.depths))
         ])
-        self.final_layer = nn.Linear(c.embed_dim, c.patch_size ** 2 * c.in_channels)
+        
+        # This will now be Size([32, 768]) which matches your .pt file
+        self.final_layer = nn.Linear(c.embed_dim, c.patch_size ** 2 * self.out_channels)
 
     def forward(self, x, t=None, clip_embeddings=None, degradation_type=None, severity=None, precomputed_cond=None):
+        # Auto-cast input to BFloat16 to match model weights
+        x = x.to(self.patch_embedding.projection.weight.dtype)
+        
         # 1. Patch partition
         x, (H, W) = self.patch_embedding(x) 
 
-        # 2. Conditioning: Force [Batch, Embed_Dim] shape
+        # 2. Conditioning
         if precomputed_cond is not None:
             t_feature = precomputed_cond.view(x.shape[0], -1) 
         else:
             t_feature = self.time_embedding(t, clip_embeddings, degradation_type, severity)
 
-        # 3. Swin blocks (Broadcasting t_feature [B, 1, D] happens inside blocks)
+        # 3. Swin blocks
         for block in self.blocks:
             x = block(x, t_feature, H, W)
 
         # 4. Fold back
         x = self.final_layer(x)
         B, N, Cpatch = x.shape
-        in_ch = self.patch_embedding.projection.in_channels
-        p = int((Cpatch // in_ch) ** 0.5)
-        return (x.view(B, H, W, p, p, in_ch).permute(0, 5, 1, 3, 2, 4).contiguous().view(B, in_ch, H * p, W * p))
+        
+        out_ch = self.out_channels
+        p = int((Cpatch // out_ch) ** 0.5)
+        
+        return (x.view(B, H, W, p, p, out_ch)
+                .permute(0, 5, 1, 3, 2, 4)
+                .contiguous()
+                .view(B, out_ch, H * p, W * p))
