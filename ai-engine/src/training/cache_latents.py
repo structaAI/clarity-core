@@ -15,7 +15,9 @@ from tqdm import tqdm
 from safetensors.torch import save_file
 
 # --- Security & Environment ---
-load_dotenv()
+script_path = Path(__file__).resolve()
+project_root = script_path.parents[2]
+load_dotenv(dotenv_path=project_root / ".env.local")
 
 logging.basicConfig(
     level=logging.INFO,
