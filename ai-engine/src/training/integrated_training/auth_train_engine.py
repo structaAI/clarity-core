@@ -1,106 +1,204 @@
+from __future__ import annotations
+
+import json
+import logging
 import os
+import random
+import sys
+from pathlib import Path
+from typing import List, Optional
+
 import torch
 import torch.nn as nn
-from tqdm import tqdm
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-from torch.cuda.amp import autocast, GradScaler
-from transformers import SiglipModel, SiglipProcessor
-from diffusers import AutoencoderKL # type: ignore
-# --- 1. CONFIGURATION ---
-class SimpleConfig:
-    def __init__(self):
-        self.model = self
-        self.patch_size = 4
-        self.in_channels = 4
-        self.embed_dim = 1024
-        self.depths = [2, 2, 6, 2]
-        self.num_heads = [4, 8, 16, 32]
-        self.window_size = 8
-        self.use_pswa_bridge = True
-        self.bridge_type = "auth"
+import torch.nn.functional as F
+from accelerate import Accelerator
+from dotenv import load_dotenv
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+from transformers import AutoModel, AutoTokenizer
 
-config = SimpleConfig()
+# ---------------------------------------------------------------------------
+# 1. BOOTSTRAP (Must happen before 'src' imports)
+# ---------------------------------------------------------------------------
+script_path = Path(__file__).resolve()
+# integrated_training is at src/training/integrated_training/ (3 levels from root)
+project_root = script_path.parents[3] 
 
-# --- 2. SETUP ---
-DEVICE = torch.device("cuda")
-SIGLIP_PATH = r"D:\Structa\claritycore\ai-engine\src\models\CLIP\saved_models\siglip-so400m-patch14-384"
-VAE_PATH = r"D:\Structa\claritycore\ai-engine\src\models\vae\saved_models"
-HR_DIR = r"D:\Structa\claritycore\ai-engine\data\train2017"
-LR_DIR = r"D:\Structa\claritycore\ai-engine\data\train2017_lr"
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-torch.set_float32_matmul_precision('high')
+load_dotenv(dotenv_path=project_root / ".env.local")
 
-# --- 3. DATASET ---
-class AuthDataset(Dataset):
-    def __init__(self, hr_dir, lr_dir):
-        self.hr_dir, self.lr_dir = hr_dir, lr_dir
-        self.imgs = [f for f in os.listdir(lr_dir) if f.endswith('.jpg')]
-        self.tf = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
+from src.datasets.auth_swin_dataset import AuthSwinDataset
+from src.models.diffusion.diffusion_engine import GaussianDiffusion
+from src.models.swin_dit.backbone import SwinDiT
+from src.utils.config_manager_swin_dit import load_config
 
-    def __getitem__(self, idx):
-        name = self.imgs[idx]
-        hr = self.tf(Image.open(os.path.join(self.hr_dir, name)).convert("RGB"))
-        lr = self.tf(Image.open(os.path.join(self.lr_dir, name)).convert("RGB"))
-        return lr, hr, name
+# ---------------------------------------------------------------------------
+# 2. LOGGING & HYPER-PARAMETERS
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger(__name__)
 
-    def __len__(self): return len(self.imgs)
+NUM_EPOCHS:           int   = int(os.getenv("NUM_EPOCHS",   "15"))
+LEARNING_RATE:        float = float(os.getenv("LEARNING_RATE", "3e-5"))
+BATCH_SIZE:           int   = int(os.getenv("BATCH_SIZE",   "4"))
+NUM_WORKERS:          int   = int(os.getenv("NUM_WORKERS",  "2"))
+CFG_DROPOUT:          float = float(os.getenv("CFG_DROPOUT",  "0.1"))
+GRAD_CLIP:            float = float(os.getenv("GRAD_CLIP",    "1.0"))
+GRAD_ACCUM:           int   = int(os.getenv("GRAD_ACCUM",   "1"))
+PRETRAINED_CHECKPOINT: str = os.getenv("PRETRAINED_CHECKPOINT", "")
 
-# --- 4. INITIALIZATION ---
-vae = AutoencoderKL.from_pretrained(VAE_PATH).to(DEVICE).eval() # type: ignore
-siglip = SiglipModel.from_pretrained(SIGLIP_PATH).to(DEVICE).eval() # type: ignore
-processor = SiglipProcessor.from_pretrained(SIGLIP_PATH)
+DEFAULT_CLIP_PATH = str(project_root / "src" / "models" / "CLIP" / "saved_models" / "siglip-so400m-patch14-384")
+CLIP_MODEL_PATH: str = os.getenv("CLIP_MODEL_SAVE_PATH", DEFAULT_CLIP_PATH)
 
-# Main Models
-from src.models.swin_dit.backbone import SwinDiT # Use your updated SwinDiT with AuthBridge
-model = SwinDiT(config).to(DEVICE).train()
-fusion_layer = nn.Linear(1152 + 1024, config.model.embed_dim).to(DEVICE).train()
+LATENT_CACHE_DIR:    str   = os.getenv("LATENT_CACHE_DIR", "")
+MODEL_SAVE_DIR:      Path  = project_root / "src" / "models" / "swin_dit" / "saved_models"
 
-# Placeholder for your Swin-LR branch (Ensure this is defined in your environment)
-# swin_lr_encoder = ... 
+_FALLBACK_PROMPTS: List[str] = [
+    "a high quality, sharp, detailed photograph",
+    "restored high resolution image with clear textures",
+    "crisp, noise-free 4K photograph",
+    "visually sharp and detailed image, professional quality",
+]
 
-optimizer = torch.optim.AdamW(list(model.parameters()) + list(fusion_layer.parameters()), lr=5e-5)
-scaler = GradScaler()
+# ---------------------------------------------------------------------------
+# 3. TEXT ENCODER (Isolates Text Tower to avoid PixelValue errors)
+# ---------------------------------------------------------------------------
 
-# --- 5. TRAINING LOOP ---
-loader = DataLoader(AuthDataset(HR_DIR, LR_DIR), batch_size=1, shuffle=True, pin_memory=True)
-
-for epoch in range(12):
-    pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch+1}")
-    for i, (lr, hr, _) in pbar:
-        lr, hr = lr.to(DEVICE), hr.to(DEVICE)
-        optimizer.zero_grad()
+class TextEncoder(nn.Module):
+    def __init__(self, clip_path: str, model_dim: int) -> None:
+        super().__init__()
+        log.info(f"Loading text encoder from: {clip_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(clip_path, local_files_only=True)
+        full_model = AutoModel.from_pretrained(clip_path, local_files_only=True)
         
-        with autocast(dtype=torch.bfloat16):
-            with torch.no_grad():
-                # Fix: Accessing distribution via index or latent_dist safely
-                vae_out = vae.encode(hr)
-                latents = (vae_out.latent_dist.sample() if hasattr(vae_out, 'latent_dist') else vae_out[0].sample()) * 0.18215
-                
-                # Fix: SigLIP positional call for return_tensors
-                text_in = processor(["high quality restoration"], padding="max_length", return_tensors="pt").to(DEVICE)
-                text_emb = siglip.get_text_features(**text_in) # [1, 1152]
-                
-                # Spatial branch
-                lr_feat = swin_lr_encoder(lr).mean(dim=[2,3]) # [1, 1024]
+        # FIX: Target the text sub-model directly to avoid vision encoder requirements
+        if hasattr(full_model, "text_model"):
+            self.backbone = full_model.text_model
+        else:
+            self.backbone = full_model
             
-            # Fix: Cat logic (using a list)
-            full_cond = fusion_layer(torch.cat([text_emb, lr_feat], dim=-1))
-            
-            t = torch.randint(0, 1000, (1,), device=DEVICE).long()
-            noise = torch.randn_like(latents)
-            noisy_latents = latents + noise
-            
-            pred = model(noisy_latents, t=t, precomputed_cond=full_cond)
-            loss = nn.MSELoss()(pred, noise)
-            
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        self.backbone.eval()
+        for p in self.backbone.parameters():
+            p.requires_grad_(False)
 
-    torch.save(model.state_dict(), f"checkpoints/auth_e{epoch+1}.pt")
+        with torch.no_grad():
+            dummy = self.tokenizer(["probe"], return_tensors="pt", padding=True, truncation=True)
+            output = self.backbone(**dummy)
+            
+            # Extract Tensor from BaseModelOutput object
+            if hasattr(output, "pooler_output") and output.pooler_output is not None:
+                probe = output.pooler_output
+            elif hasattr(output, "last_hidden_state"):
+                probe = output.last_hidden_state.mean(1)
+            else:
+                probe = output[0] if isinstance(output, (list, tuple)) else output
+        
+        clip_dim = probe.shape[-1]
+        log.info(f"  Text Model detected. Dim: {clip_dim} → SwinDiT dim: {model_dim}")
+
+        self.projection = nn.Sequential(
+            nn.Linear(clip_dim, model_dim),
+            nn.SiLU(),
+            nn.Linear(model_dim, model_dim),
+        )
+
+    def encode(self, prompts: List[str], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+        with torch.no_grad():
+            output = self.backbone(**inputs)
+            if hasattr(output, "pooler_output") and output.pooler_output is not None:
+                raw = output.pooler_output
+            else:
+                raw = output.last_hidden_state.mean(1)
+        return self.projection(raw.to(dtype))
+
+# ---------------------------------------------------------------------------
+# 4. TRAINING LOGIC
+# ---------------------------------------------------------------------------
+
+def train() -> None:
+    accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=GRAD_ACCUM)
+
+    if accelerator.is_main_process:
+        MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+    config_path = project_root / "src" / "configs" / "swin_dit_config.yaml"
+    swin_config = load_config(str(config_path))
+
+    diffusion = GaussianDiffusion(
+        num_timesteps=swin_config.diffusion.num_sampling_steps,
+        schedule=swin_config.diffusion.noise_schedule,
+    )
+
+    model = SwinDiT(swin_config)
+    
+    # Text Encoder Initialization (Guaranteed String)
+    if not Path(CLIP_MODEL_PATH).exists():
+        raise FileNotFoundError(f"SigLIP weights missing at {CLIP_MODEL_PATH}")
+    
+    text_encoder = TextEncoder(clip_path=CLIP_MODEL_PATH, model_dim=swin_config.model.embed_dim)
+    text_encoder.backbone.to(accelerator.device)
+
+    dataset = AuthSwinDataset(LATENT_CACHE_DIR)
+    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
+
+    trainable = list(model.parameters()) + list(text_encoder.projection.parameters())
+    optimizer = torch.optim.AdamW(trainable, lr=LEARNING_RATE)
+
+    model, text_encoder.projection, optimizer, train_loader = accelerator.prepare(
+        model, text_encoder.projection, optimizer, train_loader
+    )
+
+    # Sync diffusion buffers
+    for attr in ["betas", "alphas", "alphas_cumprod", "sqrt_alphas_cumprod", "sqrt_one_minus_alphas_cumprod"]:
+        if hasattr(diffusion, attr):
+            setattr(diffusion, attr, getattr(diffusion, attr).to(accelerator.device))
+
+    log.info("🚀 Starting Auth-SwinDiff Integrated Training...")
+    
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        text_encoder.projection.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not accelerator.is_local_main_process)
+
+        for batch in pbar:
+            with accelerator.accumulate(model):
+                optimizer.zero_grad()
+                
+                hr, lr = batch["hr"], batch["lr"]
+                t = torch.randint(0, swin_config.diffusion.num_sampling_steps, (hr.shape[0],), device=hr.device)
+                
+                noise = torch.randn_like(hr)
+                x_t = diffusion.q_sample(hr, t, noise=noise)
+                
+                # Channel-wise concatenation [B, 8, H, W]
+                x_input = torch.cat([x_t, lr], dim=1)
+                
+                captions = [random.choice(_FALLBACK_PROMPTS) for _ in range(hr.shape[0])]
+                clip_embed = text_encoder.encode(captions, accelerator.device, hr.dtype)
+
+                pred = model(x_input, t, clip_embeddings=clip_embed)
+                
+                # Loss on HR noise branch (channels 0-3)
+                loss = F.mse_loss(pred[:, :4, ...], noise)
+                
+                accelerator.backward(loss)
+                optimizer.step()
+                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        if accelerator.is_main_process:
+            save_path = MODEL_SAVE_DIR / f"auth_integrated_epoch_{epoch+1}.pt"
+            torch.save({
+                "model_state_dict": accelerator.unwrap_model(model).state_dict(),
+                "projection_state_dict": accelerator.unwrap_model(text_encoder.projection).state_dict()
+            }, save_path)
+
+if __name__ == "__main__":
+    torch.multiprocessing.set_start_method("spawn", force=True)
+    train()
