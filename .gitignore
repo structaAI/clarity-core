@@ -38,3 +38,6 @@ experiments/
 
 # Gradio UI Files
 .gradio/
+
+# Inference Outputs
+inference_outputs/
