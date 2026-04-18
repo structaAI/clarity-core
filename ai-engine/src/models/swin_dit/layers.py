@@ -88,7 +88,6 @@ class TimeStepEmbedding(nn.Module):
     )
 
     # 2. CLIP projection: raw CLIP dim → hidden_size
-    #    Always constructed so the attribute always exists on the module.
     self.clip_proj: CLIPProjection = CLIPProjection(
       clip_dim=clip_dim,
       model_dim=hidden_size,
@@ -116,19 +115,6 @@ class TimeStepEmbedding(nn.Module):
   # ------------------------------------------------------------------
 
   def _sinusoidal_embed(self, t: torch.Tensor) -> torch.Tensor:
-    """
-    Compute sinusoidal positional encoding for scalar timestep tensor t.
-
-    Parameters
-    ----------
-    t : torch.Tensor
-        Shape [] or [B] — integer timestep values.
-
-    Returns
-    -------
-    torch.Tensor
-        Shape [B, frequency_embedding_size].
-    """
     half_dim = self.frequency_embedding_size // 2
     freqs = torch.exp(
       -math.log(10000)
@@ -145,44 +131,26 @@ class TimeStepEmbedding(nn.Module):
   # ------------------------------------------------------------------
 
   def forward(self, t: torch.Tensor, clip_embeddings: Optional[torch.Tensor] = None, degradation_type: Optional[torch.Tensor] = None, severity: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """
-    Parameters
-    ----------
-    t : torch.Tensor
-        Shape [B] — diffusion timestep indices.
-    clip_embeddings : torch.Tensor, optional
-        Shape [B, clip_dim] — raw CLIP encoder output.
-    degradation_type : torch.Tensor, optional
-        Shape [B] — integer degradation class indices.
-    severity : torch.Tensor, optional
-        Shape [B] — float severity values in [0, 1].
-
-    Returns
-    -------
-    torch.Tensor
-        Shape [B, hidden_size] — fused conditioning vector.
-    """
-    # 1. Base timestep embedding
-    t_freq = self._sinusoidal_embed(t)
+    # Cast sinusoidal output to model dtype (fixes float32/bfloat16 mismatch)
+    model_dtype = next(self.mlp.parameters()).dtype
+    t_freq = self._sinusoidal_embed(t).to(model_dtype)
     t_embed = self.mlp(t_freq)              # [B, hidden_size]
 
-    # 2. Accumulate token sequence for fusion attention
     tokens = [t_embed.unsqueeze(1)]         # [B, 1, hidden_size]
 
     if clip_embeddings is not None:
-      c_embed = self.clip_proj(clip_embeddings)   # [B, hidden_size]
-      tokens.append(c_embed.unsqueeze(1))         # [B, 1, hidden_size]
+      c_embed = self.clip_proj(clip_embeddings)
+      tokens.append(c_embed.unsqueeze(1))
 
     if degradation_type is not None:
-      type_embed = self.type_embeddings(degradation_type)  # [B, hidden_size]
+      type_embed = self.type_embeddings(degradation_type)
       tokens.append(type_embed.unsqueeze(1))
 
     if severity is not None:
-      sev_input = severity.float().unsqueeze(-1)           # [B, 1]
-      sev_embed = self.severity_encoder(sev_input)         # [B, hidden_size]
+      sev_input = severity.float().unsqueeze(-1).to(model_dtype)
+      sev_embed = self.severity_encoder(sev_input)
       tokens.append(sev_embed.unsqueeze(1))
 
-    # 3. Fuse: query = t_embed, keys/values = all tokens
     token_seq = torch.cat(tokens, dim=1)    # [B, T, hidden_size]
     query = t_embed.unsqueeze(1)            # [B, 1, hidden_size]
 
@@ -208,12 +176,6 @@ class SwinPatchEmbed(nn.Module):
       Number of input channels (default: 4, matching the SDXL-VAE latent).
   embed_dim : int
       Projection embedding dimensionality (default: 768).
-
-  Returns
-  -------
-  Tuple[torch.Tensor, Tuple[int, int]]
-      - Normalised sequence: [B, H/P * W/P, embed_dim]
-      - (H, W) grid dimensions after patch partition.
   """
 
   def __init__(self, patch_size: int = 2, no_of_in_channels: int = 4, embed_dim: int = 768) -> None:
@@ -227,7 +189,7 @@ class SwinPatchEmbed(nn.Module):
     self.norm: nn.LayerNorm = nn.LayerNorm(embed_dim)
 
   def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
-    x = self.projection(x)           # [B, embed_dim, H/P, W/P]
+    x = self.projection(x)
     _, _, H, W = x.shape
-    x = x.flatten(2).transpose(1, 2)  # [B, H*W, embed_dim]
+    x = x.flatten(2).transpose(1, 2)
     return self.norm(x), (H, W)
