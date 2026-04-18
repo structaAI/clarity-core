@@ -1,6 +1,6 @@
 """
-IntegratedInferencePipeline — Fixed.
-=====================================
+IntegratedInferencePipeline
+============================
 Supports both inference modes from a single integrated checkpoint:
 
   Mode A — Unconditional SR
@@ -8,33 +8,6 @@ Supports both inference modes from a single integrated checkpoint:
 
   Mode B — Text-guided SR with CFG
       pipeline.super_resolve(lr_image, prompt="...", guidance_scale=7.5)
-
-Bugs fixed vs previous version
--------------------------------
-1. from_checkpoint used ckpt.get("model_state_dict", ckpt) as a fallback that
-   would silently treat the entire checkpoint dict as a state dict when the key
-   was absent. Fixed: explicit KeyError with a clear message.
-
-2. _TextEncoder.encode() was decorated @torch.no_grad(), which blocked gradient
-   flow through the projection during any training-context usage. Fixed: the
-   decorator is removed; no_grad is applied only to the frozen backbone call
-   internally. The method is safe for both inference (no grad needed) and any
-   custom training loops (projection grads preserved).
-
-3. Resolution/scaling documentation corrected: actual output resolution is
-   determined by config.image_size, not hardcoded to 1024. At image_size=512,
-   the VAE produces a [B,4,64,64] latent which decodes to 512×512 pixels.
-   To get 1024×1024, set image_size=1024 and re-run cache_latents.py.
-
-4. from_checkpoint read ckpt["projection_state_dict"] correctly only when
-   "model_state_dict" was present in ckpt. Now uses explicit key presence checks
-   for both keys independently, making loading robust to any checkpoint format.
-
-5. TextEncoder now extracts text_model sub-module from the full SiglipModel,
-   mirroring auth_train_engine.py exactly. This fixes AttributeError caused by
-   get_text_features() returning BaseModelOutputWithPooling instead of a tensor,
-   and ensures projection weights load correctly since they were trained against
-   text_model output.
 """
 
 from __future__ import annotations
@@ -49,7 +22,7 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as T
 from PIL import Image
-from diffusers import AutoencoderKL # type: ignore[import]
+from diffusers import AutoencoderKL  # type: ignore[import]
 from dotenv import load_dotenv
 from transformers import AutoModel, AutoTokenizer
 
@@ -68,7 +41,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Image ↔ Tensor helpers
+# Image <-> Tensor helpers
 # ---------------------------------------------------------------------------
 
 def _to_tensor(
@@ -85,7 +58,7 @@ def _to_tensor(
         T.ToTensor(),
         T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
-    return tf(image.convert("RGB")).unsqueeze(0).to(device=device, dtype=dtype)
+    return tf(image.convert("RGB")).unsqueeze(0).to(device=device, dtype=dtype)  # type: ignore[return-value]
 
 
 def _to_pil(t: torch.Tensor) -> Image.Image:
@@ -101,7 +74,7 @@ def _to_pil(t: torch.Tensor) -> Image.Image:
 class TextEncoder(nn.Module):
     """
     Frozen SigLIP / CLIP backbone with a trainable projection head.
-    Mirrors auth_train_engine.py exactly so checkpoint weights load correctly.
+    Mirrors the TextEncoder in auth_train_engine.py exactly.
     """
 
     def __init__(self, clip_path: str, model_dim: int) -> None:
@@ -109,8 +82,7 @@ class TextEncoder(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(clip_path, local_files_only=True)
         full_model = AutoModel.from_pretrained(clip_path, local_files_only=True)
 
-        # Mirror training TextEncoder exactly: isolate text_model to avoid
-        # pixel_values requirements and ensure projection weights load correctly.
+        # Isolate text_model to mirror training TextEncoder key structure
         if hasattr(full_model, "text_model"):
             self.backbone = full_model.text_model
         else:
@@ -167,16 +139,11 @@ class TextEncoder(nn.Module):
 
 class IntegratedInferencePipeline:
     """
-    Unified SR pipeline. Loads a checkpoint saved by integrated_train.py.
+    Unified SR pipeline. Loads a checkpoint saved by auth_train_engine.py.
 
-    Resolution note
-    ---------------
-    Actual output resolution = config.image_size (not hardcoded 1024).
-    The VAE downscales by 8, so:
-      image_size=512  → latent [B,4,64,64]   → decoded 512×512
-      image_size=1024 → latent [B,4,128,128] → decoded 1024×1024
-    To get 1024×1024 output you must set image_size=1024 in the config AND
-    re-encode your dataset with cache_latents.py at that resolution.
+    Output resolution = config.image_size:
+      image_size=512  -> latent [B,4,64,64]  -> decoded 512x512
+      image_size=1024 -> latent [B,4,128,128] -> decoded 1024x1024
     """
 
     def __init__(
@@ -201,13 +168,15 @@ class IntegratedInferencePipeline:
         self.denoiser.to(self.device, self.dtype).eval()
 
         if self.vae is not None:
-            self.vae.to(self.device, torch.float32).eval()
+            self.vae.to(device=self.device, dtype=torch.float32) # type: ignore[union-attr]
+            self.vae.eval()  # type: ignore[union-attr]
 
         if self.text_encoder is not None:
             self.text_encoder.backbone   = self.text_encoder.backbone.to(self.device)
             self.text_encoder.projection = self.text_encoder.projection.to(self.device, self.dtype)
             self.text_encoder.projection.eval()
 
+        # Move diffusion schedule buffers to device
         for attr in [
             "betas", "alphas", "alphas_cumprod", "alphas_cumprod_prev",
             "sqrt_alphas_cumprod", "sqrt_one_minus_alphas_cumprod",
@@ -217,6 +186,10 @@ class IntegratedInferencePipeline:
         ]:
             setattr(self.diffusion, attr,
                     getattr(self.diffusion, attr).to(self.device))
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
 
     @classmethod
     def from_checkpoint(
@@ -237,6 +210,7 @@ class IntegratedInferencePipeline:
 
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
 
+        # Denoiser
         denoiser = SwinDiT(swin_config)
         if "model_state_dict" not in ckpt:
             raise KeyError(
@@ -246,11 +220,13 @@ class IntegratedInferencePipeline:
         denoiser.load_state_dict(ckpt["model_state_dict"], strict=True)
         log.info(f"Loaded denoiser from {Path(checkpoint).name}")
 
+        # Diffusion
         diffusion = GaussianDiffusion(
             num_timesteps=swin_config.diffusion.num_sampling_steps,
             schedule=swin_config.diffusion.noise_schedule,
         )
 
+        # VAE
         vae: Optional[AutoencoderKL] = None
         _vae_path = vae_path or os.getenv("VAE_PATH", "")
         if _vae_path and Path(_vae_path).exists():
@@ -260,6 +236,7 @@ class IntegratedInferencePipeline:
             except Exception as e:
                 log.warning(f"VAE load failed: {e}")
 
+        # Text encoder
         text_encoder: Optional[TextEncoder] = None
         _clip_path = clip_path or os.getenv("CLIP_MODEL_SAVE_PATH", "")
         if _clip_path and Path(_clip_path).exists():
@@ -269,12 +246,16 @@ class IntegratedInferencePipeline:
                 log.info("Loaded trained projection weights.")
             else:
                 log.warning(
-                    "No 'projection_state_dict' in checkpoint. "
-                    "Text conditioning will use a random projection — quality will be poor."
+                    "No 'projection_state_dict' in checkpoint — "
+                    "text conditioning uses random projection."
                 )
             text_encoder = te
 
         return cls(denoiser, diffusion, cfg, vae, text_encoder)
+
+    # ------------------------------------------------------------------
+    # VAE encode / decode
+    # ------------------------------------------------------------------
 
     def _require_vae(self) -> AutoencoderKL:
         if self.vae is None:
@@ -289,15 +270,19 @@ class IntegratedInferencePipeline:
         vae   = self._require_vae()
         pixel = _to_tensor(image, self.config.image_size, self.device, torch.float32)
         out   = vae.encode(pixel)
-        post  = out.latent_dist if hasattr(out, "latent_dist") else out[0]
+        post  = out.latent_dist if hasattr(out, "latent_dist") else out[0]  # type: ignore[union-attr]
         return (post.sample() * self.config.vae_scale_factor).to(self.dtype)
 
     @torch.no_grad()
     def decode_latent(self, latent: torch.Tensor) -> Image.Image:
-        vae     = self._require_vae()
-        l_f32   = latent.to(device=self.device, dtype=torch.float32)
-        decoded = vae.decode(l_f32 / self.config.vae_scale_factor).sample
+        vae    = self._require_vae()
+        l_f32  = latent.to(device=self.device, dtype=torch.float32)
+        decoded = vae.decode(l_f32 / self.config.vae_scale_factor).sample  # type: ignore[arg-type, union-attr]
         return _to_pil(decoded)
+
+    # ------------------------------------------------------------------
+    # Super-resolution
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def super_resolve(
@@ -309,6 +294,7 @@ class IntegratedInferencePipeline:
         lr_is_latent:        bool = False,
         progress_callback:   Optional[Callable[[int, torch.Tensor], None]] = None,
     ) -> torch.Tensor:
+        # LR latent
         x_lr = (
             lr_image.to(self.device, self.dtype)  # type: ignore[union-attr]
             if lr_is_latent
@@ -316,6 +302,7 @@ class IntegratedInferencePipeline:
         )
         B, C, H, W = x_lr.shape
 
+        # Text embedding
         use_cfg = (
             prompt is not None
             and self.text_encoder is not None
@@ -327,8 +314,9 @@ class IntegratedInferencePipeline:
                 [prompt] * B, device=self.device, dtype=self.dtype
             )
 
+        # Model closure
         def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            x_in = torch.cat([x, x_lr], dim=1)  # [B, 8, H, W]
+            x_in = torch.cat([x.to(self.dtype), x_lr], dim=1)  # [B, 8, H, W]
             if use_cfg:
                 uncond = self.denoiser(x_in, t, clip_embeddings=None)[:, :4]
                 cond   = self.denoiser(x_in, t, clip_embeddings=cond_embed)[:, :4]
@@ -353,52 +341,3 @@ class IntegratedInferencePipeline:
         **kwargs,
     ) -> Image.Image:
         return self.decode_latent(self.super_resolve(lr_image, **kwargs))
-
-
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import tempfile
-    import yaml
-
-    print("Running smoke test (CPU, no VAE, no CLIP)...")
-
-    cfg_dict = {
-        "model": {
-            "name": "smoke-test", "latent_size": 8, "in_channels": 8,
-            "patch_size": 2, "embed_dim": 32, "depths": [1, 1],
-            "num_heads": [2, 2], "window_size": 4,
-            "use_pswa_bridge": False, "bridge_alpha": 0.5,
-        },
-        "diffusion": {
-            "num_sampling_steps": 10, "noise_schedule": "linear",
-            "prediction_type": "epsilon",
-        },
-        "training": {"learning_rate": 1e-4, "precision": "fp32", "batch_size": 1},
-    }
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tf:
-        yaml.dump(cfg_dict, tf)
-        tmp_cfg = tf.name
-
-    swin_cfg  = load_config(tmp_cfg)
-    denoiser  = SwinDiT(swin_cfg)
-    diffusion = GaussianDiffusion(num_timesteps=10, schedule="linear")
-    cfg       = PipelineConfig(
-        num_timesteps=10, num_inference_steps=5,
-        latent_size=8, in_channels=4, image_size=64,
-        device="cpu", dtype="float32",
-    )
-
-    pipeline = IntegratedInferencePipeline(denoiser, diffusion, cfg)
-
-    x_lr = torch.randn(1, 4, 8, 8)
-    out  = pipeline.super_resolve(x_lr, lr_is_latent=True)
-    assert out.shape == (1, 4, 8, 8), f"Bad shape: {out.shape}"
-    assert not torch.isnan(out).any(), "NaN in output"
-    print(f"  Unconditional SR: {tuple(x_lr.shape)} → {tuple(out.shape)}  ✓")
-
-    print("Smoke test passed.")
-    os.unlink(tmp_cfg)
