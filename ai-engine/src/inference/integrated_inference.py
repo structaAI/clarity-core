@@ -29,6 +29,12 @@ Bugs fixed vs previous version
 4. from_checkpoint read ckpt["projection_state_dict"] correctly only when
    "model_state_dict" was present in ckpt. Now uses explicit key presence checks
    for both keys independently, making loading robust to any checkpoint format.
+
+5. TextEncoder now extracts text_model sub-module from the full SiglipModel,
+   mirroring auth_train_engine.py exactly. This fixes AttributeError caused by
+   get_text_features() returning BaseModelOutputWithPooling instead of a tensor,
+   and ensures projection weights load correctly since they were trained against
+   text_model output.
 """
 
 from __future__ import annotations
@@ -79,7 +85,7 @@ def _to_tensor(
         T.ToTensor(),
         T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
-    return tf(image.convert("RGB")).unsqueeze(0).to(device=device, dtype=dtype) # type: ignore[return-value]
+    return tf(image.convert("RGB")).unsqueeze(0).to(device=device, dtype=dtype)
 
 
 def _to_pil(t: torch.Tensor) -> Image.Image:
@@ -95,24 +101,34 @@ def _to_pil(t: torch.Tensor) -> Image.Image:
 class TextEncoder(nn.Module):
     """
     Frozen SigLIP / CLIP backbone with a trainable projection head.
-    Mirrors the TextEncoder in integrated_train.py exactly so checkpoint
-    weights load without key mismatches.
+    Mirrors auth_train_engine.py exactly so checkpoint weights load correctly.
     """
 
     def __init__(self, clip_path: str, model_dim: int) -> None:
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(clip_path, local_files_only=True)
-        self.backbone  = AutoModel.from_pretrained(clip_path, local_files_only=True)
+        full_model = AutoModel.from_pretrained(clip_path, local_files_only=True)
+
+        # Mirror training TextEncoder exactly: isolate text_model to avoid
+        # pixel_values requirements and ensure projection weights load correctly.
+        if hasattr(full_model, "text_model"):
+            self.backbone = full_model.text_model
+        else:
+            self.backbone = full_model
+
         self.backbone.eval()
         for p in self.backbone.parameters():
             p.requires_grad_(False)
 
         with torch.no_grad():
             dummy = self.tokenizer(["probe"], return_tensors="pt", padding=True, truncation=True)
-            if hasattr(self.backbone, "get_text_features"):
-                probe = self.backbone.get_text_features(**dummy)
+            output = self.backbone(**dummy)
+            if hasattr(output, "pooler_output") and output.pooler_output is not None:
+                probe = output.pooler_output
+            elif hasattr(output, "last_hidden_state"):
+                probe = output.last_hidden_state.mean(1)
             else:
-                probe = self.backbone(**dummy).last_hidden_state.mean(1)
+                probe = output[0] if isinstance(output, (list, tuple)) else output
         clip_dim = probe.shape[-1]
 
         self.projection = nn.Sequential(
@@ -127,14 +143,6 @@ class TextEncoder(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """
-        Encode prompts to [B, model_dim] conditioning vectors.
-
-        FIX: @torch.no_grad() is NOT applied to the whole method.
-        no_grad wraps only the frozen backbone; projection runs normally.
-        This preserves gradient flow if encode() is ever called in a
-        training context, and is still correct for inference.
-        """
         inputs = self.tokenizer(
             prompts,
             return_tensors="pt",
@@ -144,10 +152,11 @@ class TextEncoder(nn.Module):
         ).to(device)
 
         with torch.no_grad():
-            if hasattr(self.backbone, "get_text_features"):
-                raw = self.backbone.get_text_features(**inputs)
+            output = self.backbone(**inputs)
+            if hasattr(output, "pooler_output") and output.pooler_output is not None:
+                raw = output.pooler_output
             else:
-                raw = self.backbone(**inputs).last_hidden_state.mean(1)
+                raw = output.last_hidden_state.mean(1)
 
         return self.projection(raw.to(dtype))  # [B, model_dim]
 
@@ -192,15 +201,13 @@ class IntegratedInferencePipeline:
         self.denoiser.to(self.device, self.dtype).eval()
 
         if self.vae is not None:
-            self.vae.to(self.device, torch.float32).eval() # type: ignore[union-attr]
+            self.vae.to(self.device, torch.float32).eval()
 
         if self.text_encoder is not None:
             self.text_encoder.backbone   = self.text_encoder.backbone.to(self.device)
             self.text_encoder.projection = self.text_encoder.projection.to(self.device, self.dtype)
             self.text_encoder.projection.eval()
 
-        # Move diffusion buffers to device + match model dtype to avoid
-        # silent fp32 promotion during sampling steps
         for attr in [
             "betas", "alphas", "alphas_cumprod", "alphas_cumprod_prev",
             "sqrt_alphas_cumprod", "sqrt_one_minus_alphas_cumprod",
@@ -210,10 +217,6 @@ class IntegratedInferencePipeline:
         ]:
             setattr(self.diffusion, attr,
                     getattr(self.diffusion, attr).to(self.device))
-
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_checkpoint(
@@ -225,27 +228,15 @@ class IntegratedInferencePipeline:
         device:      str = "cuda",
         dtype:       str = "bfloat16",
     ) -> "IntegratedInferencePipeline":
-        """
-        Load the pipeline from an integrated_train.py checkpoint.
-
-        Parameters
-        ----------
-        config_path : str  Path to swin_dit_config.yaml.
-        checkpoint  : str  Path to integrated_epoch_N.pt.
-        clip_path   : str, optional  SigLIP / CLIP directory. None → uncond only.
-        vae_path    : str, optional  AutoencoderKL directory. None → latent mode.
-        """
         swin_config = load_config(config_path)
         cfg         = PipelineConfig.from_yaml(config_path)
         cfg.device  = device
-        cfg.dtype   = dtype # type: ignore[assignment]
+        cfg.dtype   = dtype  # type: ignore[assignment]
         if vae_path:
             cfg.vae_path = vae_path
 
-        # FIX: load checkpoint once; use explicit key checks for each sub-dict.
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
 
-        # --- Denoiser ---
         denoiser = SwinDiT(swin_config)
         if "model_state_dict" not in ckpt:
             raise KeyError(
@@ -255,13 +246,11 @@ class IntegratedInferencePipeline:
         denoiser.load_state_dict(ckpt["model_state_dict"], strict=True)
         log.info(f"Loaded denoiser from {Path(checkpoint).name}")
 
-        # --- Diffusion ---
         diffusion = GaussianDiffusion(
             num_timesteps=swin_config.diffusion.num_sampling_steps,
             schedule=swin_config.diffusion.noise_schedule,
         )
 
-        # --- VAE ---
         vae: Optional[AutoencoderKL] = None
         _vae_path = vae_path or os.getenv("VAE_PATH", "")
         if _vae_path and Path(_vae_path).exists():
@@ -271,29 +260,21 @@ class IntegratedInferencePipeline:
             except Exception as e:
                 log.warning(f"VAE load failed: {e}")
 
-        # --- Text encoder ---
         text_encoder: Optional[TextEncoder] = None
         _clip_path = clip_path or os.getenv("CLIP_MODEL_SAVE_PATH", "")
         if _clip_path and Path(_clip_path).exists():
             te = TextEncoder(clip_path=_clip_path, model_dim=swin_config.model.embed_dim)
-
-            # FIX: check for projection key independently of model_state_dict
             if "projection_state_dict" in ckpt:
                 te.projection.load_state_dict(ckpt["projection_state_dict"])
                 log.info("Loaded trained projection weights.")
             else:
                 log.warning(
                     "No 'projection_state_dict' in checkpoint. "
-                    "Text conditioning will use a random projection — quality will be poor. "
-                    "Did you train with integrated_train.py?"
+                    "Text conditioning will use a random projection — quality will be poor."
                 )
             text_encoder = te
 
         return cls(denoiser, diffusion, cfg, vae, text_encoder)
-
-    # ------------------------------------------------------------------
-    # VAE encode / decode
-    # ------------------------------------------------------------------
 
     def _require_vae(self) -> AutoencoderKL:
         if self.vae is None:
@@ -305,24 +286,18 @@ class IntegratedInferencePipeline:
 
     @torch.no_grad()
     def encode_image(self, image: Union[Image.Image, torch.Tensor]) -> torch.Tensor:
-        """Encode a PIL image or pixel tensor to a VAE latent."""
         vae   = self._require_vae()
         pixel = _to_tensor(image, self.config.image_size, self.device, torch.float32)
         out   = vae.encode(pixel)
-        post  = out.latent_dist if hasattr(out, "latent_dist") else out[0] # type: ignore[union-attr]
+        post  = out.latent_dist if hasattr(out, "latent_dist") else out[0]
         return (post.sample() * self.config.vae_scale_factor).to(self.dtype)
 
     @torch.no_grad()
     def decode_latent(self, latent: torch.Tensor) -> Image.Image:
-        """Decode a VAE latent to a PIL image."""
-        vae    = self._require_vae()
-        l_f32  = latent.to(device=self.device, dtype=torch.float32)
-        decoded = vae.decode(l_f32 / self.config.vae_scale_factor).sample # type: ignore[union-attr]
+        vae     = self._require_vae()
+        l_f32   = latent.to(device=self.device, dtype=torch.float32)
+        decoded = vae.decode(l_f32 / self.config.vae_scale_factor).sample
         return _to_pil(decoded)
-
-    # ------------------------------------------------------------------
-    # Super-resolution
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def super_resolve(
@@ -334,27 +309,6 @@ class IntegratedInferencePipeline:
         lr_is_latent:        bool = False,
         progress_callback:   Optional[Callable[[int, torch.Tensor], None]] = None,
     ) -> torch.Tensor:
-        """
-        Super-resolve a low-resolution image.
-
-        Output resolution is controlled by config.image_size:
-          image_size=512  → output 512×512 px
-          image_size=1024 → output 1024×1024 px  (requires re-encoding dataset)
-
-        Parameters
-        ----------
-        lr_image         : PIL.Image or torch.Tensor  Low-res input.
-        prompt           : str, optional              Text guidance. None → unconditional.
-        guidance_scale   : float                      CFG scale. 1.0 = no guidance.
-        num_inference_steps : int, optional           Steps. Defaults to config value.
-        lr_is_latent     : bool                       Skip VAE; lr_image is already a latent.
-        progress_callback: Callable, optional         Called each step with (step_idx, x).
-
-        Returns
-        -------
-        torch.Tensor  HR latent [B, 4, H, W]. Decode with decode_latent().
-        """
-        # -- LR latent --
         x_lr = (
             lr_image.to(self.device, self.dtype)  # type: ignore[union-attr]
             if lr_is_latent
@@ -362,7 +316,6 @@ class IntegratedInferencePipeline:
         )
         B, C, H, W = x_lr.shape
 
-        # -- Text embedding --
         use_cfg = (
             prompt is not None
             and self.text_encoder is not None
@@ -374,21 +327,16 @@ class IntegratedInferencePipeline:
                 [prompt] * B, device=self.device, dtype=self.dtype
             )
 
-        # -- Model closure with CFG --
         def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             x_in = torch.cat([x, x_lr], dim=1)  # [B, 8, H, W]
-
             if use_cfg:
-                # Two forward passes: unconditional then conditional
                 uncond = self.denoiser(x_in, t, clip_embeddings=None)[:, :4]
                 cond   = self.denoiser(x_in, t, clip_embeddings=cond_embed)[:, :4]
-                # CFG blend
                 return uncond + guidance_scale * (cond - uncond)
             else:
                 out = self.denoiser(x_in, t, clip_embeddings=cond_embed)
                 return out[:, :4] if out.shape[1] == 8 else out
 
-        # -- Reverse diffusion --
         return self.diffusion.p_sample_loop(
             model_fn=model_fn,
             shape=(B, C, H, W),
@@ -404,7 +352,6 @@ class IntegratedInferencePipeline:
         lr_image: Union[Image.Image, torch.Tensor],
         **kwargs,
     ) -> Image.Image:
-        """Convenience wrapper: LR image → decoded HR PIL image."""
         return self.decode_latent(self.super_resolve(lr_image, **kwargs))
 
 
@@ -413,7 +360,6 @@ class IntegratedInferencePipeline:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import os
     import tempfile
     import yaml
 
