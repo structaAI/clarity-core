@@ -7,7 +7,10 @@ import os
 import yaml
 from types import SimpleNamespace
 from transformers import SiglipTokenizer, SiglipTextModel
+from dotenv import load_dotenv
 
+
+load_dotenv(".env.local")
 # Internal Imports
 from src.models.swin_dit.backbone import SwinDiT
 from src.models.bridge.auth_bridge import AuthBridge
