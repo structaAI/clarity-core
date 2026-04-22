@@ -90,7 +90,7 @@ def restore_image(input_img, prompt, timestep):
 
 # 4. GRADIO INTERFACE
 with gr.Blocks(theme="soft") as demo:
-    gr.Markdown("# 🚀 Structa Labs | ClarityCore")
+    gr.Markdown("# Structa Labs | ClarityCore")
     gr.Markdown("### Auth-SwinDiff Reasoning-Based Restoration")
     
     with gr.Tab("Restoration Engine"):

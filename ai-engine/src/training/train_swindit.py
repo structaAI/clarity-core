@@ -166,7 +166,7 @@ def train():
     )
 
     # --- LR scheduler: cosine decay over NUM_EPOCHS ---
-    NUM_EPOCHS = 10 if is_finetuning else 30
+    NUM_EPOCHS = 15 if is_finetuning else 30
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=NUM_EPOCHS,
@@ -260,7 +260,7 @@ def train():
 
         if accelerator.is_main_process:
             unwrapped_model = accelerator.unwrap_model(model)
-            save_path = MODEL_SAVE_DIR / f"swindit_epoch_{epoch + 1}.pt"
+            save_path = MODEL_SAVE_DIR / f"swindit_v2_epoch_{epoch + 1}.pt"
             torch.save(unwrapped_model.state_dict(), save_path)
 
             with open(resume_file, "w") as f:
