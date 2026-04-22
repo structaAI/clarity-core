@@ -77,7 +77,7 @@ class AuthSwinDataset(Dataset):
             lr: Tensor = F.interpolate(
                 lr_small.unsqueeze(0).float(),  # [1, 4, H/4, W/4]
                 size=(H, W),
-                mode="bilinear",
+                mode="bicubic",
                 align_corners=False,
             ).squeeze(0).to(hr.dtype)           # [4, H, W]
 
