@@ -3,7 +3,8 @@
 model:
   name: "Auth-SwinDiff-V1"
   latent_size: 64            
-  in_channels: 8             
+  in_channels: 8
+  out_channels: 8             
   patch_size: 2              
   embed_dim: 768             
   
